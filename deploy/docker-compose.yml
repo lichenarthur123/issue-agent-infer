@@ -1,0 +1,130 @@
+name: qwen-agent-stack
+
+# 三个 vLLM 实例共享 GB10 统一内存(约 121GB 可用):
+#   planner  0.11 (~13GB) + vision 0.41 (~50GB) + grounder 0.20 (~24GB)
+#   合计 ~87GB,给系统/桌面预留 ~30GB
+# 已通过 depends_on(service_healthy) 形成启动链 vision → grounder → planner
+# 注意: Qwen2.5-VL 架构模型(gta1)不能用 --kv-cache-dtype fp8, 会输出乱码;
+#       Qwen3 架构(planner/vision)可以
+
+x-common: &common
+  restart: unless-stopped
+  logging:
+    driver: json-file
+    options:
+      max-size: 100m
+      max-file: "3"
+
+services:
+  planner:
+    <<: *common
+    image: nvcr.io/nvidia/vllm:26.10-py3
+    container_name: vllm-planner
+    depends_on:
+      grounder:
+        condition: service_healthy
+    ipc: host
+    ports:
+      - "8001:8000"
+    volumes:
+      - ../models:/models:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    command:
+      - bash
+      - -lc
+      - >-
+        exec vllm serve /models/qwen3-4b-instruct-2507-fp8
+        --served-model-name qwen3-4b-instruct-2507
+        --port 8000
+        --gpu-memory-utilization 0.11
+        --max-model-len 49152
+        --kv-cache-dtype fp8
+        --max-num-seqs 8
+        --speculative-config '{"method":"ngram","num_speculative_tokens":5,"prompt_lookup_max":4,"prompt_lookup_min":1}'
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 60
+      start_period: 600s
+
+  vision:
+    <<: *common
+    image: nvcr.io/nvidia/vllm:26.10-py3
+    container_name: vllm-vision
+    ipc: host
+    ports:
+      - "8002:8000"
+    volumes:
+      - ../models:/models:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    command:
+      - bash
+      - -lc
+      - >-
+        exec vllm serve /models/qwen3.8-27b-fp8
+        --served-model-name qwen3.8-27b-fp8
+        --port 8000
+        --gpu-memory-utilization 0.40
+        --max-model-len 65536
+        --kv-cache-dtype fp8
+        --enable-auto-tool-choice
+        --tool-call-parser qwen3_xml
+        --reasoning-parser qwen3
+        --speculative-config '{"method":"mtp","num_speculative_tokens":3}'
+        --max-num-seqs 8
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 60
+      start_period: 900s
+
+  grounder:
+    <<: *common
+    image: nvcr.io/nvidia/vllm:26.10-py3
+    container_name: vllm-grounder
+    depends_on:
+      vision:
+        condition: service_healthy
+    ipc: host
+    ports:
+      - "8003:8000"
+    volumes:
+      - ../models:/models:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    command:
+      - bash
+      - -lc
+      - >-
+        exec vllm serve /models/gta1-7b
+        --served-model-name gta1-7b ui-tars-1.5-7b
+        --port 8000
+        --gpu-memory-utilization 0.20
+        --max-model-len 32768
+        --max-num-seqs 8
+        --speculative-config '{"method":"ngram","num_speculative_tokens":5,"prompt_lookup_max":4,"prompt_lookup_min":1}'
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 60
+      start_period: 600s
