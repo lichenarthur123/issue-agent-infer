@@ -1,11 +1,13 @@
 name: qwen-agent-stack
 
 # 三个 vLLM 实例共享 GB10 统一内存(约 121GB 可用):
-#   planner  0.11 (~13GB) + vision 0.41 (~50GB) + grounder 0.20 (~24GB)
-#   合计 ~87GB,给系统/桌面预留 ~30GB
+#   planner  0.11 (~13GB) + vision 0.40 (~48GB) + grounder 0.20 (~24GB)
+#   合计 ~85GB,给系统/桌面预留 ~35GB
 # 已通过 depends_on(service_healthy) 形成启动链 vision → grounder → planner
+# 单并发优化: 全部 max-num-seqs 8; vision 用 MTP 投机(实测最优, 5token/DFlash2 更慢),
+#   planner/grounder 用 ngram; vision 的 max-num-seqs 上限 209(Mamba 缓存块数)
 # 注意: Qwen2.5-VL 架构模型(gta1)不能用 --kv-cache-dtype fp8, 会输出乱码;
-#       Qwen3 架构(planner/vision)可以
+#       Qwen3 架构(planner/vision)可以; vision(Qwen3.8)工具调用解析器须用 qwen3_xml
 
 x-common: &common
   restart: unless-stopped

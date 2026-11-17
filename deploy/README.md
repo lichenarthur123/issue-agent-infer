@@ -4,8 +4,8 @@
 
 | 角色 | 模型 | 端口 | served-model-name |
 |---|---|---|---|
-| Planner | Qwen/Qwen3-4B-Instruct-2507 | 8001 | `qwen3-4b-instruct-2507` |
-| 视觉模型 | Qwen/Qwen3-VL-32B-Instruct-FP8 | 8002 | `qwen3-vl-32b-instruct-fp8` |
+| Planner | Qwen/Qwen3-4B-Instruct-2507-FP8 | 8001 | `qwen3-4b-instruct-2507` |
+| 视觉模型 | Qwen/Qwen3.8-27B-FP8（原生多模态，可控 thinking） | 8002 | `qwen3.8-27b-fp8` |
 | Grounder | HelloKKMe/GTA1-7B | 8003 | `gta1-7b`（别名 `ui-tars-1.5-7b`） |
 
 镜像：`nvcr.io/nvidia/vllm:26.10-py3`（arm64，NGC 直连可拉）
@@ -15,12 +15,22 @@
 
 | 实例 | gpu-memory-utilization | 约合 | 内容 |
 |---|---|---|---|
-| vision | 0.41 | ~50GB | FP8 权重 ~34GB + KV(65536, FP8 KV) |
+| vision | 0.40 | ~48GB | FP8 权重 ~29GB + KV 12.76GB(65536, FP8 KV) |
 | grounder | 0.20 | ~24GB | GTA1-7B BF16 权重 ~17GB + KV(32768) |
 | planner | 0.11 | ~13GB | FP8 权重 ~5GB + KV(49152, FP8 KV) |
 
-合计 ~87GB，给桌面/系统预留 ~30GB。如需更长的 context，先加 vision 的
-`--max-model-len`（KV 每 token ~256KB），再相应上调 utilization。
+合计 ~85GB，给桌面/系统预留 ~35GB。如需更长的 context，先加 vision 的
+`--max-model-len`（KV 每 token ~47KB），再相应上调 utilization。
+
+## 单并发优化（2026-11-17）
+
+- 全部 `--max-num-seqs 8`（单并发场景，vision 侧上限 209，受 Mamba 缓存块数限制）
+- vision：MTP 投机解码 3 token（实测 7.5 → 12.0 tok/s；5 token 或 DFlash2 反而更慢）
+- planner / grounder：ngram 投机解码（重复输出接受率 100%）
+- vision 工具调用：`--enable-auto-tool-choice --tool-call-parser qwen3_xml`
+  （Qwen3.8 输出 qwen3xml 格式，hermes 解析不了）
+- vision 推理分离：`--reasoning-parser qwen3`，响应里思考在 `reasoning` 字段；
+  请求加 `"chat_template_kwargs": {"enable_thinking": false}` 可关 thinking
 
 ## 启动（顺序很重要：先大后小）
 
@@ -56,7 +66,7 @@ curl localhost:8001/v1/chat/completions -H 'Content-Type: application/json' -d '
 
 # vision / grounder 图文（把 base64 图片放进 image_url）
 curl localhost:8002/v1/chat/completions -H 'Content-Type: application/json' -d '{
-  "model": "qwen3-vl-32b-instruct-fp8",
+  "model": "qwen3.8-27b-fp8",
   "messages": [{"role": "user", "content": [
     {"type": "text", "text": "描述这张图"},
     {"type": "image_url", "image_url": {"url": "data:image/png;base64,<BASE64>"}}

@@ -5,8 +5,12 @@
 | 角色 | 模型 | 端口 | served-model-name |
 |---|---|---|---|
 | Planner | Qwen3-4B-Instruct-2507-**FP8** | **8001** | `qwen3-4b-instruct-2507` |
-| 视觉 | Qwen3-VL-32B-Instruct-FP8 | **8002** | `qwen3-vl-32b-instruct-fp8` |
+| 视觉 | Qwen3.8-27B-FP8（原生多模态，按请求开关 thinking） | **8002** | `qwen3.8-27b-fp8` |
 | Grounder | GTA1-7B（Salesforce，定位基准优于 UI-TARS） | **8003** | `gta1-7b`（兼容别名 `ui-tars-1.5-7b`） |
+
+> 注：vision 已于 2026-11-17 从 Qwen3-VL-32B-Instruct-FP8 切换为 Qwen3.8-27B-FP8
+> （更新一代、原生多模态、自带可控 thinking、实测解码 ~12 tok/s）。
+> 旧权重仍在 models/ 下，回退只需改 compose 两行。
 
 - 镜像：`nvcr.io/nvidia/vllm:26.10-py3`（arm64）
 - 编排文件：`deploy/docker-compose.yml`
@@ -134,7 +138,7 @@ curl localhost:8001/v1/chat/completions -H 'Content-Type: application/json' -d '
 
 ```bash
 curl localhost:8002/v1/chat/completions -H 'Content-Type: application/json' -d '{
-  "model": "qwen3-vl-32b-instruct-fp8",
+  "model": "qwen3.8-27b-fp8",
   "messages": [{"role": "user", "content": [
     {"type": "text", "text": "描述这张图"},
     {"type": "image_url", "image_url": {"url": "data:image/png;base64,<BASE64图片>"}}
@@ -142,6 +146,24 @@ curl localhost:8002/v1/chat/completions -H 'Content-Type: application/json' -d '
   "max_tokens": 200
 }'
 ```
+
+### vision（工具调用，解析器为 qwen3_xml）
+
+```bash
+curl localhost:8002/v1/chat/completions -H 'Content-Type: application/json' -d '{
+  "model": "qwen3.8-27b-fp8",
+  "messages": [{"role": "user", "content": "北京今天天气怎么样？"}],
+  "tools": [{"type": "function", "function": {"name": "get_weather",
+    "description": "查询城市天气",
+    "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}}],
+  "max_tokens": 500
+}'
+```
+
+> vision 已开启 `--enable-auto-tool-choice --tool-call-parser qwen3_xml`
+> （该模型输出 qwen3xml 格式，**不要用 hermes**）和 `--reasoning-parser qwen3`
+> （思考过程在响应的 `reasoning` 字段，本版本 vLLM 不用 `reasoning_content`）。
+> 关 thinking：请求里加 `"chat_template_kwargs": {"enable_thinking": false}`。
 
 ### grounder（必须用 UI-TARS 官方 prompt 格式才会输出坐标）
 
@@ -167,12 +189,27 @@ curl localhost:8003/v1/chat/completions -H 'Content-Type: application/json' -d '
 
 | 服务 | utilization | 约合 | KV 池 | 当前上下文 |
 |---|---|---|---|---|
-| vision | 0.41 | ~50GB | ~13GB（FP8 KV，容量翻倍） | 65536 |
+| vision | 0.40 | ~48GB | 12.76GB（FP8 KV，28.7万 token） | 65536 |
 | grounder | 0.20 | ~24GB | ~2GB | 32768 |
 | planner | 0.11 | ~13GB | ~7GB（FP8 KV） | 49152 |
 
-**KV 每 token 参考**：vision ≈ 128KB（FP8 KV），planner ≈ 72KB（FP8 KV），grounder ≈ 56KB。
+**KV 每 token 参考**：vision ≈ 47KB（FP8 KV），planner ≈ 72KB（FP8 KV），grounder ≈ 56KB。
 已启用优化：vision/planner `--kv-cache-dtype fp8`（注意：**Qwen2.5-VL 架构的 grounder 不能开 FP8 KV，会输出乱码**）；planner 使用官方 FP8 权重（提速约 2 倍）；prefix caching 默认开启（实测命中率 ~48%）；grounder 已换为 GTA1-7B（ScreenSpot-Pro 50.1 vs UI-TARS-1.5 的 42.0）。
+
+### 单并发加速（2026-11-17 实测调优）
+
+三个服务均按**单并发**场景优化（`--max-num-seqs 8`），并启用投机解码：
+
+| 服务 | 方案 | 效果 |
+|---|---|---|
+| vision | MTP 投机解码 3 token（模型自带 MTP 头） | 7.5 → **12.0 tok/s（+60%）** |
+| planner / grounder | ngram 投机解码（无需草稿模型） | 重复/模板化输出接受率 100%，自由文本空转无开销 |
+
+vision 侧实测结论：MTP=3 最优；MTP=5（10.7 tok/s）和 DFlash2 草稿模型（10.9 tok/s）
+反而更慢——草稿过长时验证开销在 GB10 弱算力下不划算。DFlash2 权重保留在
+`models/qwen3.8-27b-dflash2/`，切换只需改 `--speculative-config` 一行。
+注意：vision 开投机后 Mamba 缓存块数有限，`--max-num-seqs` 不能超过 209
+（混合架构每序列独占一块 Mamba 状态缓存）。
 
 ### 调大某模型上下文
 
@@ -230,9 +267,12 @@ docker pull nvcr.io/nvidia/vllm:<新tag>   # tag 列表见 NGC catalog
 │   ├── docker-compose.yml     # 服务编排（端口/内存/上下文都在这里改）
 │   └── README.md              # 部署说明（与本文档互补）
 ├── models/
+│   ├── qwen3.8-27b-fp8/               (~29GB, vision 使用)
+│   ├── qwen3.8-27b-dflash2/           (~3.6GB, DFlash2 草稿, 备选加速)
 │   ├── qwen3-4b-instruct-2507-fp8/    (~5GB, planner 使用)
 │   ├── qwen3-4b-instruct-2507/        (~8GB, BF16 旧版, 可删)
-│   ├── qwen3-vl-32b-instruct-fp8/     (~35GB, vision 使用)
+│   ├── qwen3-vl-32b-instruct-fp8/     (~35GB, 已被 Qwen3.8-27B 替代, 可删)
+│   ├── qwen3-vl-32b-thinking-fp8/     (~34GB, 已被 Qwen3.8-27B 替代, 可删)
 │   ├── qwen3-vl-8b-instruct/          (~17GB, 备份未部署)
 │   ├── gta1-7b/                       (~17GB, grounder 使用)
 │   └── ui-tars-1.5-7b/                (~32GB, 已被 GTA1 替代, 可删)
